@@ -1,5 +1,4 @@
 secrets.h
-reference/
 build/
 *.bin
 *.elf

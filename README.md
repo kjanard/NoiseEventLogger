@@ -22,6 +22,7 @@ Designed to run continuously 24/7 to separate stationary mid-to-high-frequency n
 ## Repository Layout
 ```text
 NoiseEventLogger/
+├── reference/              # Official Waveshare ESP32-S3-RLCD-4.2 demos (read-only reference)
 ├── SPEC.md                 # Full engineering & mathematical specification
 ├── NoiseEventLogger.ino    # Boot sequence, dual-core FreeRTOS orchestration
 ├── config.h                # DSP constants, intervals, Anechoic baseline array
@@ -48,4 +49,4 @@ NoiseEventLogger/
 3. **Credentials:**
    - Copy `secrets.example.h` to `secrets.h` (already in `.gitignore`).
    - Leave `WIFI_SSID` empty (`""`) for pure offline RTC + SD + RLCD logging, or fill `WIFI_SSID` / `WIFI_PASSWORD` for automatic NTP sync (and optionally `INGEST_URL` for HTTP POST).
-4. **Hardware Reference:** Official Waveshare schematics and demos are available at [waveshareteam/ESP32-S3-RLCD-4.2](https://github.com/waveshareteam/ESP32-S3-RLCD-4.2) and the [Waveshare Wiki](https://docs.waveshare.com/ESP32-S3-RLCD-4.2). See [SPEC.md](SPEC.md) for the full design specification.
+4. **Hardware Reference:** Official Waveshare schematics and demos are available at [waveshareteam/ESP32-S3-RLCD-4.2](https://github.com/waveshareteam/ESP32-S3-RLCD-4.2) and the [Waveshare Wiki](https://docs.waveshare.com/ESP32-S3-RLCD-4.2). See [SPEC.md](SPEC.md) for the full design specification. A copy of the official Waveshare demos used for pinout/driver verification is included under [`reference/`](reference/) (Apache-2.0, see `reference/LICENSE`).
