@@ -96,7 +96,7 @@ No reflashing is needed when calibrating with a 94 dB / 1 kHz IEC 60942 calibrat
 ```text
 NoiseEventLogger/
 ├── reference/              # Official Waveshare ESP32-S3-RLCD-4.2 demos (read-only, Waveshare license)
-├── LICENSE                 # MIT License
+├── LICENSE                 # Non-Commercial & Share-Alike software license (NC-SA 1.0)
 ├── CHANGELOG.md            # Versioned acoustic/firmware/schema changelog
 ├── SPEC.md                 # Full engineering & mathematical specification (Phases 1–4)
 ├── TODO.md                 # IEC 61672 L1–L3 PTEC roadmap & Phase 5 SHTC3 backlog
@@ -153,6 +153,12 @@ Generated outputs under `reports/<date>/`:
 - `<date>_evidence_spectrogram.png`: 3-panel spectrogram (`L90` waterfall, $\Delta L_{90}$ vs quiet baseline, and `HF` vs `LA90` time series highlighting broadband masking).
 - `<date>_evidence_report.md`: Bilingual Thai/English evidence summary, detected episodes, and rejected non-target clusters (water spray / compressor).
 - `<date>_hf_episodes.csv`: Per-episode timestamps, dominant band, max emergence, prominence, and `delta_la90_dba`.
+
+---
+
+## License
+
+This project is licensed under the **Custom Non-Commercial & Share-Alike License (NC-SA 1.0)** — see the [LICENSE](LICENSE) file for details. Vendor hardware demonstration files under `reference/` remain subject to Waveshare Electronics' original license terms.
 
 ---
 
