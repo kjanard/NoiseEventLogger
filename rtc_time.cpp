@@ -26,6 +26,7 @@ bool              s_ntp_cb_registered = false;
 volatile bool     s_ntp_pending_write = false;
 bool              s_ntp_synced        = false;
 uint32_t          s_last_rtc_sync_ms  = 0;
+uint32_t          s_ntp_sync_count    = 0;
 
 uint8_t decToBcd(uint8_t val) {
   return static_cast<uint8_t>(((val / 10U) << 4) | (val % 10U));
@@ -305,13 +306,25 @@ void RtcTime_OnWifiConnected() {
     sntp_set_time_sync_notification_cb(ntpSyncNotificationCallback);
     s_ntp_cb_registered = true;
   }
+  if (esp_sntp_enabled()) {
+    esp_sntp_stop();
+  }
+  s_ntp_pending_write = false;
   configTzTime(NTP_POSIX_TZ, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
   Serial.printf("[RTC] SNTP started (TZ=%s, servers=%s, %s)\n", NTP_POSIX_TZ, NTP_SERVER_1, NTP_SERVER_2);
 }
 
+void RtcTime_OnWifiDisconnected() {
+  if (esp_sntp_enabled()) {
+    esp_sntp_stop();
+  }
+  s_ntp_pending_write = false;
+}
+
 void RtcTime_Poll() {
   const uint32_t now_ms = millis();
-  const bool periodic_due = s_ntp_synced && ((now_ms - s_last_rtc_sync_ms) >= NTP_RTC_SYNC_INTERVAL_MS);
+  const bool periodic_due = s_ntp_synced && esp_sntp_enabled() &&
+                            ((now_ms - s_last_rtc_sync_ms) >= NTP_RTC_SYNC_INTERVAL_MS);
 
   if (!s_ntp_pending_write && !periodic_due) {
     return;
@@ -330,6 +343,7 @@ void RtcTime_Poll() {
     s_rtc_ok = true;
     s_ntp_synced = true;
     s_last_rtc_sync_ms = now_ms;
+    ++s_ntp_sync_count;
     char iso[32] = {};
     RtcTime_FormatIso8601(now_epoch, iso, sizeof(iso));
     Serial.printf("[RTC] NTP synced -> PCF85063 updated: %s\n", iso);
@@ -346,6 +360,10 @@ bool RtcTime_IsRtcOk() {
 
 bool RtcTime_IsNtpSynced() {
   return s_ntp_synced;
+}
+
+uint32_t RtcTime_GetNtpSyncCount() {
+  return s_ntp_sync_count;
 }
 
 bool RtcTime_FormatIso8601(time_t epoch, char *buf, size_t len) {

@@ -3,6 +3,8 @@
 #include "config.h"
 #include <Arduino.h>
 #include <Wire.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 // ============================================================================
 // Phase 1: ES7210 + I2S Audio Capture Interface
@@ -51,3 +53,13 @@ bool AudioCapture_ReadMonoSamples(int16_t *mono_out,
  * Read back an ES7210 register over I2C for diagnostic verification.
  */
 bool AudioCapture_ReadEs7210Reg(uint8_t reg_addr, uint8_t *out_val);
+
+/**
+ * Return the quantized ES7210 manual PGA gain actually programmed (dB).
+ */
+float AudioCapture_GetConfiguredGainDb();
+
+/**
+ * Safely stop I2S RX and put ES7210 into low-power state before deep sleep.
+ */
+void AudioCapture_PowerDown(SemaphoreHandle_t i2c_mutex);

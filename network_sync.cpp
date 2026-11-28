@@ -1,7 +1,12 @@
 #include "network_sync.h"
 #include "config.h"
 #include "rtc_time.h"
+
+#if __has_include("secrets.h")
 #include "secrets.h"
+#else
+#include "secrets.example.h"
+#endif
 
 #include <HTTPClient.h>
 #include <WiFi.h>
@@ -19,7 +24,8 @@ enum WifiSmState {
   WIFI_SM_DISABLED = 0,
   WIFI_SM_CONNECTING,
   WIFI_SM_CONNECTED,
-  WIFI_SM_BACKOFF
+  WIFI_SM_BACKOFF,
+  WIFI_SM_NTP_SLEEP
 };
 
 JsonSlot       *s_http_ring        = nullptr;
@@ -30,6 +36,7 @@ size_t          s_ring_count       = 0;
 WifiSmState     s_wifi_state       = WIFI_SM_DISABLED;
 uint32_t        s_wifi_state_ts_ms = 0;
 uint32_t        s_backoff_ms       = WIFI_BACKOFF_MIN_MS;
+uint32_t        s_ntp_sync_count_seen = 0;
 
 HttpSyncState_t s_http_state       = HTTP_STATE_DISABLED;
 int             s_last_http_code   = 0;
@@ -40,11 +47,18 @@ bool hasStr(const char *s) {
   return (s != nullptr && s[0] != '\0');
 }
 
+void powerDownWifiRadio() {
+  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_OFF);
+}
+
 void startWifiAttempt() {
+  WiFi.mode(WIFI_STA);
   WiFi.disconnect(false, false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   s_wifi_state = WIFI_SM_CONNECTING;
   s_wifi_state_ts_ms = millis();
+  s_ntp_sync_count_seen = RtcTime_GetNtpSyncCount();
   Serial.println("[WiFi] Connecting (non-blocking)...");
 }
 
@@ -138,6 +152,10 @@ bool NetworkSync_Init() {
   return true;
 }
 
+bool NetworkSync_IsWifiSleeping() {
+  return (s_wifi_state == WIFI_SM_NTP_SLEEP);
+}
+
 void NetworkSync_Poll() {
   if (!s_inited || s_wifi_state == WIFI_SM_DISABLED) {
     return;
@@ -150,24 +168,44 @@ void NetworkSync_Poll() {
     case WIFI_SM_CONNECTING:
       if (st == WL_CONNECTED) {
         s_wifi_state = WIFI_SM_CONNECTED;
+        s_wifi_state_ts_ms = now_ms;
         s_backoff_ms = WIFI_BACKOFF_MIN_MS;
         Serial.printf("[WiFi] Connected | IP=%s | RSSI=%d dBm\n",
                       WiFi.localIP().toString().c_str(),
                       WiFi.RSSI());
         RtcTime_OnWifiConnected();
       } else if ((now_ms - s_wifi_state_ts_ms) >= WIFI_CONNECT_TIMEOUT_MS) {
-        WiFi.disconnect(false, false);
+        RtcTime_OnWifiDisconnected();
+        powerDownWifiRadio();
         s_wifi_state = WIFI_SM_BACKOFF;
         s_wifi_state_ts_ms = now_ms;
-        Serial.printf("[WiFi] Connect timeout -> retry in %lu ms\n", static_cast<unsigned long>(s_backoff_ms));
+        Serial.printf("[WiFi] Connect timeout -> Wi-Fi OFF, retry in %lu ms\n", static_cast<unsigned long>(s_backoff_ms));
       }
       break;
 
     case WIFI_SM_CONNECTED:
       if (st != WL_CONNECTED) {
+        RtcTime_OnWifiDisconnected();
+        powerDownWifiRadio();
         s_wifi_state = WIFI_SM_BACKOFF;
         s_wifi_state_ts_ms = now_ms;
-        Serial.printf("[WiFi] Disconnected -> retry in %lu ms\n", static_cast<unsigned long>(s_backoff_ms));
+        Serial.printf("[WiFi] Disconnected -> Wi-Fi OFF, retry in %lu ms\n", static_cast<unsigned long>(s_backoff_ms));
+      } else if (!hasStr(INGEST_URL)) {
+        const bool ntp_updated = (RtcTime_GetNtpSyncCount() != s_ntp_sync_count_seen);
+        if (ntp_updated) {
+          RtcTime_OnWifiDisconnected();
+          powerDownWifiRadio();
+          s_wifi_state = WIFI_SM_NTP_SLEEP;
+          s_wifi_state_ts_ms = now_ms;
+          Serial.println("[Net] NTP-only sync complete -> Wi-Fi powered OFF (next sync in 24h)");
+        } else if ((now_ms - s_wifi_state_ts_ms) >= NTP_WIFI_SYNC_TIMEOUT_MS) {
+          RtcTime_OnWifiDisconnected();
+          powerDownWifiRadio();
+          s_wifi_state = WIFI_SM_BACKOFF;
+          s_wifi_state_ts_ms = now_ms;
+          Serial.printf("[Net] NTP sync timeout -> Wi-Fi powered OFF, retry in %lu ms\n",
+                        static_cast<unsigned long>(s_backoff_ms));
+        }
       } else {
         processHttpQueue();
       }
@@ -179,6 +217,13 @@ void NetworkSync_Poll() {
         if (s_backoff_ms > WIFI_BACKOFF_MAX_MS) {
           s_backoff_ms = WIFI_BACKOFF_MAX_MS;
         }
+        startWifiAttempt();
+      }
+      break;
+
+    case WIFI_SM_NTP_SLEEP:
+      if ((now_ms - s_wifi_state_ts_ms) >= NTP_RTC_SYNC_INTERVAL_MS) {
+        Serial.println("[Net] 24h NTP refresh due -> waking Wi-Fi");
         startWifiAttempt();
       }
       break;

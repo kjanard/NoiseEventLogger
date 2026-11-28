@@ -1,5 +1,6 @@
 #include "storage_log.h"
 #include "board_pins.h"
+#include "calibration.h"
 #include "config.h"
 
 #include <SD_MMC.h>
@@ -11,19 +12,23 @@ namespace {
 
 constexpr const char *LOG_DIR_PATH = "/logs";
 constexpr const char *CSV_HEADER =
-    "ts,uptime_s,bb_leq,bb_l90,bb_peak,clips,"
+    "ts,uptime_s,unit,gain_db,marker,bb_leq,bb_l90,bb_peak,laeq,la90,laf_max,las_max,"
+    "clips,overload,underrange,hf_alert,hf_band_hz,hf_prom_db,"
     "leq_63,leq_80,leq_100,leq_125,leq_160,leq_200,leq_250,leq_315,"
     "leq_400,leq_500,leq_630,leq_800,leq_1k,leq_1k25,leq_1k6,leq_2k,"
-    "leq_2k5,leq_3k15,leq_4k,leq_5k,leq_6k3,leq_8k,leq_10k,leq_12k5,"
+    "leq_2k5,leq_3k15,leq_4k,leq_5k,leq_6k3,leq_8k,leq_10k,leq_12k5,leq_16k,leq_20k,"
     "l90_63,l90_80,l90_100,l90_125,l90_160,l90_200,l90_250,l90_315,"
     "l90_400,l90_500,l90_630,l90_800,l90_1k,l90_1k25,l90_1k6,l90_2k,"
-    "l90_2k5,l90_3k15,l90_4k,l90_5k,l90_6k3,l90_8k,l90_10k,l90_12k5,"
+    "l90_2k5,l90_3k15,l90_4k,l90_5k,l90_6k3,l90_8k,l90_10k,l90_12k5,l90_16k,l90_20k,"
     "vbat_mv,rssi";
 
-bool     s_sd_ok           = false;
-uint32_t s_last_mount_try  = 0;
-char     s_last_path[48]   = "NONE";
-uint32_t s_last_file_bytes = 0;
+constexpr const char *P4_HEADER_PREFIX = "ts,uptime_s,unit,gain_db,marker,";
+
+bool     s_sd_ok                = false;
+uint32_t s_last_mount_try       = 0;
+char     s_last_path[48]        = "NONE";
+char     s_verified_p4_path[48] = "";
+uint32_t s_last_file_bytes      = 0;
 
 bool appendFmt(char *buf, size_t cap, size_t *pos, const char *fmt, ...) {
   if (*pos >= cap) {
@@ -51,6 +56,7 @@ const char *cardTypeName(uint8_t t) {
 
 bool mountSdMmc() {
   s_last_mount_try = millis();
+  s_verified_p4_path[0] = '\0';
   SD_MMC.end();
   if (!SD_MMC.setPins(PIN_SDMMC_CLK, PIN_SDMMC_CMD, PIN_SDMMC_D0)) {
     Serial.println("[SD] SD_MMC.setPins failed");
@@ -94,15 +100,42 @@ bool mountSdMmc() {
   return true;
 }
 
+bool isPhase4HeaderOrEmpty(const char *path) {
+  File rf = SD_MMC.open(path, FILE_READ);
+  if (!rf) {
+    return false;
+  }
+  if (rf.size() == 0) {
+    rf.close();
+    return true;
+  }
+  char hdr[48] = {};
+  const size_t n = rf.readBytes(hdr, sizeof(hdr) - 1U);
+  hdr[n] = '\0';
+  rf.close();
+  return (strncmp(hdr, P4_HEADER_PREFIX, strlen(P4_HEADER_PREFIX)) == 0);
+}
+
 }  // namespace
 
 bool StorageLog_Init() {
   return mountSdMmc();
 }
 
+void StorageLog_Shutdown() {
+  if (s_sd_ok) {
+    SD_MMC.end();
+    s_sd_ok = false;
+    s_verified_p4_path[0] = '\0';
+    Serial.println("[SD] Safely unmounted SD_MMC");
+  }
+}
+
 bool StorageLog_AppendMinute(const MinuteReport_t &rec,
                              const char *ts_iso,
                              const char *date_ymd,
+                             float gain_db,
+                             bool marker,
                              uint32_t vbat_mv,
                              int rssi) {
   if (!s_sd_ok) {
@@ -118,6 +151,15 @@ bool StorageLog_AppendMinute(const MinuteReport_t &rec,
 
   if (!SD_MMC.exists(LOG_DIR_PATH)) {
     SD_MMC.mkdir(LOG_DIR_PATH);
+  }
+
+  // Protect legacy 56/67-column CSV files from mixed-schema appends on the same date
+  if (strcmp(path, s_verified_p4_path) != 0 && SD_MMC.exists(path) && !isPhase4HeaderOrEmpty(path)) {
+    snprintf(path, sizeof(path), "%s/%s_p4.csv", LOG_DIR_PATH, safe_date);
+    if (strcmp(path, s_verified_p4_path) != 0 && SD_MMC.exists(path) && !isPhase4HeaderOrEmpty(path)) {
+      snprintf(path, sizeof(path), "%s/%s_p4v2.csv", LOG_DIR_PATH, safe_date);
+    }
+    Serial.printf("[SD] Previous CSV header mismatch -> writing schema to %s\n", path);
   }
 
   bool need_header = !SD_MMC.exists(path);
@@ -141,17 +183,31 @@ bool StorageLog_AppendMinute(const MinuteReport_t &rec,
     }
   }
 
-  char row[768];
+  char row[1280];
   size_t pos = 0;
   const char *safe_ts = (ts_iso != nullptr && ts_iso[0] != '\0') ? ts_iso : "null";
+  const char *hf_band = (rec.hf_peak_band < OCTAVE_BAND_COUNT) ? OCTAVE_BAND_LABELS[rec.hf_peak_band] : "8k";
 
-  bool ok = appendFmt(row, sizeof(row), &pos, "%s,%lu,%.1f,%.1f,%.1f,%lu",
+  bool ok = appendFmt(row, sizeof(row), &pos,
+                      "%s,%lu,%s,%.1f,%u,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%lu,%u,%u,%u,%s,%.1f",
                       safe_ts,
                       static_cast<unsigned long>(rec.uptime_s),
+                      Calibration_GetUnitLabel(),
+                      gain_db,
+                      marker ? 1U : 0U,
                       rec.bb_leq,
                       rec.bb_l90,
                       rec.bb_peak,
-                      static_cast<unsigned long>(rec.clips));
+                      rec.laeq,
+                      rec.la90,
+                      rec.laf_max,
+                      rec.las_max,
+                      static_cast<unsigned long>(rec.clips),
+                      rec.overload ? 1U : 0U,
+                      rec.underrange ? 1U : 0U,
+                      rec.hf_alert ? 1U : 0U,
+                      hf_band,
+                      rec.hf_prom_db);
 
   for (uint8_t b = 0; ok && b < OCTAVE_BAND_COUNT; ++b) {
     ok = appendFmt(row, sizeof(row), &pos, ",%.1f", rec.oct_leq[b]);
@@ -176,6 +232,7 @@ bool StorageLog_AppendMinute(const MinuteReport_t &rec,
   const uint32_t new_size = static_cast<uint32_t>(f.size());
   f.close();
 
+  snprintf(s_verified_p4_path, sizeof(s_verified_p4_path), "%s", path);
   snprintf(s_last_path, sizeof(s_last_path), "%s", path);
   s_last_file_bytes = new_size;
   Serial.printf("[SD] Appended %s (bytes=%lu%s)\n",

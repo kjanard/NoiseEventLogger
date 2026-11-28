@@ -271,7 +271,6 @@ const char *httpStateLabel(HttpSyncState_t st) {
   }
 }
 
-// Reference: reference/examples/arduino/examples/03_ADC_Test/adc_bsp.cpp (3.00V=0%, 4.12V=100%)
 uint8_t batteryPercentFromMv(uint32_t vbat_mv) {
   if (vbat_mv <= 3000U) {
     return 0U;
@@ -419,6 +418,8 @@ void DisplayUi_Render(const DisplayUiState_t &state) {
     snprintf(top_r1, sizeof(top_r1), "%s W:OFF  SD:%s", clk_src, state.sd_ok ? "OK" : "ERR");
   } else if (state.wifi_connected) {
     snprintf(top_r1, sizeof(top_r1), "%s W:%ddB SD:%s", clk_src, state.rssi, state.sd_ok ? "OK" : "ERR");
+  } else if (state.wifi_sleeping) {
+    snprintf(top_r1, sizeof(top_r1), "%s W:SLP  SD:%s", clk_src, state.sd_ok ? "OK" : "ERR");
   } else {
     snprintf(top_r1, sizeof(top_r1), "%s W:...  SD:%s", clk_src, state.sd_ok ? "OK" : "ERR");
   }
@@ -431,14 +432,21 @@ void DisplayUi_Render(const DisplayUiState_t &state) {
   drawText(238, 13, top_r2, COLOR_WHITE, 1);
 
   // --- 2. Center Broadband Readout Cards (y = 28..111) ---
-  // Left Card: BB LIVE 1s
+  // Left Card: Live 1s (LAeq when calibrated in dBA, else broadband Leq in dBFS)
   drawRect(6, 28, 191, 84, COLOR_BLACK);
   drawHLine(6, 43, 191, COLOR_BLACK);
-  drawText(12, 32, "BB LIVE 1s (dBFS)", COLOR_BLACK, 1);
+  drawText(12, 32, state.calibrated ? "LIVE 1s LAeq (dBA)" : "LIVE 1s LEQ (dBFS)", COLOR_BLACK, 1);
+
+  const bool live_ovl = (state.has_sec && state.sec.overload_1s) || (state.has_min && state.min.overload);
+  if (live_ovl) {
+    fillRect(168, 29, 28, 14, COLOR_BLACK);
+    drawText(173, 32, "OVL", COLOR_WHITE, 1);
+  }
 
   char leq_str[16];
   if (state.has_sec) {
-    snprintf(leq_str, sizeof(leq_str), "%5.1f", state.sec.bb_leq_1s);
+    const float primary_1s = state.calibrated ? state.sec.laeq_1s : state.sec.bb_leq_1s;
+    snprintf(leq_str, sizeof(leq_str), "%5.1f", primary_1s);
   } else {
     snprintf(leq_str, sizeof(leq_str), " --.-");
   }
@@ -446,28 +454,48 @@ void DisplayUi_Render(const DisplayUiState_t &state) {
 
   char leq_sub1[36];
   if (state.has_sec) {
-    snprintf(leq_sub1, sizeof(leq_sub1), "1s Peak: %5.1f dBFS", state.sec.bb_peak_1s);
+    if (state.calibrated) {
+      snprintf(leq_sub1, sizeof(leq_sub1), "LAFmax:%5.1f LZ:%5.1f", state.sec.laf_max_1s, state.sec.bb_leq_1s);
+    } else {
+      snprintf(leq_sub1, sizeof(leq_sub1), "A-wt:%5.1f Pk:%5.1f", state.sec.laeq_1s, state.sec.bb_peak_1s);
+    }
   } else {
-    snprintf(leq_sub1, sizeof(leq_sub1), "1s Peak:  --.- dBFS");
+    snprintf(leq_sub1, sizeof(leq_sub1), "A-wt: --.- Pk: --.-");
   }
   drawText(12, 83, leq_sub1, COLOR_BLACK, 1);
 
   char leq_sub2[36];
   if (state.has_min) {
-    snprintf(leq_sub2, sizeof(leq_sub2), "1m Leq:%5.1f Pk:%5.1f", state.min.bb_leq, state.min.bb_peak);
+    if (state.calibrated) {
+      snprintf(leq_sub2, sizeof(leq_sub2), "1m LAeq:%5.1f LAS:%5.1f", state.min.laeq, state.min.las_max);
+    } else {
+      snprintf(leq_sub2, sizeof(leq_sub2), "1m Leq:%5.1f LAeq:%5.1f", state.min.bb_leq, state.min.laeq);
+    }
   } else {
     snprintf(leq_sub2, sizeof(leq_sub2), "1m Avg: Warmup %02u/60s", static_cast<unsigned>(state.warmup_sec));
   }
   drawText(12, 96, leq_sub2, COLOR_BLACK, 1);
 
-  // Right Card: BB 1m L90 Floor
+  // Right Card: 1m L90 Floor & HF Stationary Jet Nuisance Status
   drawRect(203, 28, 191, 84, COLOR_BLACK);
-  drawHLine(203, 43, 191, COLOR_BLACK);
-  drawText(209, 32, "BB 1m L90 FLOOR (dBFS)", COLOR_BLACK, 1);
+  const bool hf_alert = state.has_min && state.min.hf_alert;
+  const uint8_t hf_idx = (state.has_min && state.min.hf_peak_band < OCTAVE_BAND_COUNT) ? state.min.hf_peak_band : 21;
+  const char *hf_band_lbl = OCTAVE_BAND_LABELS[hf_idx];
+
+  if (hf_alert) {
+    fillRect(203, 28, 191, 16, COLOR_BLACK);
+    char alert_hdr[32];
+    snprintf(alert_hdr, sizeof(alert_hdr), "! HF JET ALERT (%sHz) !", hf_band_lbl);
+    drawText(209, 32, alert_hdr, COLOR_WHITE, 1);
+  } else {
+    drawHLine(203, 43, 191, COLOR_BLACK);
+    drawText(209, 32, state.calibrated ? "1m L90 FLOOR (dBA)" : "1m L90 FLOOR (dBFS)", COLOR_BLACK, 1);
+  }
 
   char l90_str[16];
   if (state.has_min) {
-    snprintf(l90_str, sizeof(l90_str), "%5.1f", state.min.bb_l90);
+    const float floor_1m = state.calibrated ? state.min.la90 : state.min.bb_l90;
+    snprintf(l90_str, sizeof(l90_str), "%5.1f", floor_1m);
   } else {
     snprintf(l90_str, sizeof(l90_str), " --.-");
   }
@@ -475,8 +503,10 @@ void DisplayUi_Render(const DisplayUiState_t &state) {
 
   char l90_sub1[36];
   if (state.has_min) {
-    const float delta = state.min.bb_leq - state.min.bb_l90;
-    snprintf(l90_sub1, sizeof(l90_sub1), "1m Leq-L90: %+5.1f dB", delta);
+    snprintf(l90_sub1, sizeof(l90_sub1), "HF(%s):%+4.1fdB Day:%lum",
+             hf_band_lbl,
+             state.min.hf_prom_db,
+             static_cast<unsigned long>(state.hf_events_today));
   } else {
     snprintf(l90_sub1, sizeof(l90_sub1), "Waiting 1st minute...");
   }
@@ -484,82 +514,109 @@ void DisplayUi_Render(const DisplayUiState_t &state) {
 
   char l90_sub2[36];
   const uint32_t clips = state.has_min ? state.min.clips : (state.has_sec ? state.sec.clips_1s : 0);
-  snprintf(l90_sub2, sizeof(l90_sub2), "Sec:%02u/60 Clips:%lu Q:%u",
-           static_cast<unsigned>(state.warmup_sec),
-           static_cast<unsigned long>(clips),
-           static_cast<unsigned>(state.http_queued));
+  if (state.has_min && state.min.overload) {
+    snprintf(l90_sub2, sizeof(l90_sub2), "Sec:%02u/60 OVL!   Q:%u",
+             static_cast<unsigned>(state.warmup_sec),
+             static_cast<unsigned>(state.http_queued));
+  } else if ((state.has_min && state.min.underrange) || (!state.has_min && state.has_sec && state.sec.underrange_1s)) {
+    snprintf(l90_sub2, sizeof(l90_sub2), "Sec:%02u/60 UR     Q:%u",
+             static_cast<unsigned>(state.warmup_sec),
+             static_cast<unsigned>(state.http_queued));
+  } else {
+    snprintf(l90_sub2, sizeof(l90_sub2), "Sec:%02u/60 Clp:%lu Q:%u",
+             static_cast<unsigned>(state.warmup_sec),
+             static_cast<unsigned long>(clips),
+             static_cast<unsigned>(state.http_queued));
+  }
   drawText(209, 96, l90_sub2, COLOR_BLACK, 1);
 
-  // --- 3. Lower 24-Band 1/3-Octave Spectrum Graph (y = 117..278) ---
-  drawText(6, 118, "1/3-OCTAVE (63Hz-12.5kHz)", COLOR_BLACK, 1);
+  // --- 3. Lower 26-Band 1/3-Octave Spectrum Graph (y = 117..278) ---
+  drawText(6, 118, "1/3-OCT (63Hz-20kHz)", COLOR_BLACK, 1);
+
+  char gain_lbl[12];
+  snprintf(gain_lbl, sizeof(gain_lbl), "G:+%.0fdB", state.gain_db);
+  drawText(132, 118, gain_lbl, COLOR_BLACK, 1);
+
+  if (state.marker_active) {
+    fillRect(178, 116, 56, 11, COLOR_BLACK);
+    drawText(188, 118, "*MARK*", COLOR_WHITE, 1);
+  } else {
+    drawText(188, 118, "M:OFF", COLOR_BLACK, 1);
+  }
+
   drawText(244, 118, state.has_min ? "Bar=L90 Box=1s --=Floor" : "Bar=1s Live   --=Floor", COLOR_BLACK, 1);
 
-  constexpr int PLOT_X = 34;
+  constexpr int PLOT_X = 32;
   constexpr int PLOT_Y = 131;
-  constexpr int PLOT_W = 360;  // 24 bars * 15 px
-  constexpr int PLOT_H = 120;  // -100 to -20 dBFS => 1.5 px/dB
+  constexpr int BAR_PITCH = 14;
+  constexpr int BAR_WIDTH = 10;
+  constexpr int PLOT_W = OCTAVE_BAND_COUNT * BAR_PITCH;  // 26 * 14 = 364 px (32+364=396 < 400)
+  constexpr int PLOT_H = 120;  // 80 dB span => 1.5 px/dB
   constexpr int PLOT_BOTTOM = PLOT_Y + PLOT_H;
-  constexpr float DB_MIN = -100.0f;
-  constexpr float DB_MAX = -20.0f;
   constexpr float PX_PER_DB = 1.5f;
+
+  const float axis_shift = state.calibrated ? (roundf(state.cal_offset_db / 10.0f) * 10.0f) : 0.0f;
+  const float db_min = -100.0f + axis_shift;
+  const float db_max = -20.0f + axis_shift;
 
   drawRect(PLOT_X - 1, PLOT_Y - 1, PLOT_W + 2, PLOT_H + 2, COLOR_BLACK);
 
-  // Y-axis gridlines & labels
-  const int db_ticks[] = { -20, -40, -60, -80, -100 };
-  for (size_t i = 0; i < sizeof(db_ticks) / sizeof(db_ticks[0]); ++i) {
-    const int db = db_ticks[i];
-    const int gy = PLOT_Y + ((static_cast<int>(DB_MAX) - db) * PLOT_H) / 80;
-    if (db > -100 && db < -20) {
+  // Y-axis gridlines & dynamic dBFS/dBSPL labels
+  const int db_offsets[] = { 80, 60, 40, 20, 0 };
+  for (size_t i = 0; i < sizeof(db_offsets) / sizeof(db_offsets[0]); ++i) {
+    const int db_val = static_cast<int>(lroundf(db_min)) + db_offsets[i];
+    const int gy = PLOT_Y + ((80 - db_offsets[i]) * PLOT_H) / 80;
+    if (i > 0 && i < 4) {
       drawDottedHLine(PLOT_X, gy, PLOT_W, COLOR_BLACK, 4);
     }
     char y_lbl[8];
-    snprintf(y_lbl, sizeof(y_lbl), "%4d", db);
-    drawText(4, gy - 3, y_lbl, COLOR_BLACK, 1);
+    snprintf(y_lbl, sizeof(y_lbl), "%4d", db_val);
+    drawText(2, gy - 3, y_lbl, COLOR_BLACK, 1);
   }
 
-  // 24 x 1/3-octave bars (width 11 px, pitch 15 px)
+  // 26 x 1/3-octave bars (width 10 px, pitch 14 px)
   const bool have_bars = (state.has_min || state.has_sec);
   if (have_bars) {
     for (uint8_t b = 0; b < OCTAVE_BAND_COUNT; ++b) {
-      const int bar_x = PLOT_X + (static_cast<int>(b) * 15) + 2;
+      const int bar_x = PLOT_X + (static_cast<int>(b) * BAR_PITCH) + 2;
 
       if (!state.has_min) {
-        const int live_h = dbToBarHeightPx(state.sec.oct_1s[b], DB_MIN, DB_MAX, PX_PER_DB);
+        const int live_h = dbToBarHeightPx(state.sec.oct_1s[b], db_min, db_max, PX_PER_DB);
         if (live_h > 0) {
-          fillRect(bar_x, PLOT_BOTTOM - live_h, 11, live_h, COLOR_BLACK);
+          fillRect(bar_x, PLOT_BOTTOM - live_h, BAR_WIDTH, live_h, COLOR_BLACK);
         }
       } else {
-        const int l90_h = dbToBarHeightPx(state.min.oct_l90[b], DB_MIN, DB_MAX, PX_PER_DB);
+        const int l90_h = dbToBarHeightPx(state.min.oct_l90[b], db_min, db_max, PX_PER_DB);
         if (l90_h > 0) {
-          fillRect(bar_x, PLOT_BOTTOM - l90_h, 11, l90_h, COLOR_BLACK);
+          fillRect(bar_x, PLOT_BOTTOM - l90_h, BAR_WIDTH, l90_h, COLOR_BLACK);
         }
 
         if (state.has_sec) {
-          const int live_h = dbToBarHeightPx(state.sec.oct_1s[b], DB_MIN, DB_MAX, PX_PER_DB);
+          const int live_h = dbToBarHeightPx(state.sec.oct_1s[b], db_min, db_max, PX_PER_DB);
           if (live_h > l90_h + 1) {
-            drawRect(bar_x, PLOT_BOTTOM - live_h, 11, (live_h - l90_h) + 1, COLOR_BLACK);
-            fillRect(bar_x, PLOT_BOTTOM - live_h, 11, 2, COLOR_BLACK);
+            drawRect(bar_x, PLOT_BOTTOM - live_h, BAR_WIDTH, (live_h - l90_h) + 1, COLOR_BLACK);
+            fillRect(bar_x, PLOT_BOTTOM - live_h, BAR_WIDTH, 2, COLOR_BLACK);
           } else if (live_h >= 2 && live_h < l90_h) {
-            drawHLine(bar_x + 1, PLOT_BOTTOM - live_h, 9, COLOR_WHITE);
+            drawHLine(bar_x + 1, PLOT_BOTTOM - live_h, BAR_WIDTH - 2, COLOR_WHITE);
           }
         }
       }
 
       // Small tick under each band
-      drawVLine(bar_x + 5, PLOT_BOTTOM + 1, 3, COLOR_BLACK);
+      drawVLine(bar_x + 4, PLOT_BOTTOM + 1, 3, COLOR_BLACK);
     }
   } else {
     drawText(130, PLOT_Y + 56, "Waiting for audio frames...", COLOR_BLACK, 1);
   }
 
-  // Contrast-inverting dashed Anechoic Self-Noise Floor reference curve across all 24 bands
+  // Contrast-inverting dashed Anechoic Self-Noise Floor reference curve across all 26 bands
   for (uint8_t b = 0; b < OCTAVE_BAND_COUNT; ++b) {
-    const int col_x   = PLOT_X + (static_cast<int>(b) * 15);
-    const int floor_h = dbToBarHeightPx(ANECHOIC_OCT_L90_DBFS[b], DB_MIN, DB_MAX, PX_PER_DB);
+    const int col_x   = PLOT_X + (static_cast<int>(b) * BAR_PITCH);
+    const float ref_db = AnechoicOctL90Dbfs(b) + (state.calibrated ? state.cal_offset_db : 0.0f);
+    const int floor_h = dbToBarHeightPx(ref_db, db_min, db_max, PX_PER_DB);
     const int floor_y = PLOT_BOTTOM - floor_h;
     if (floor_y > PLOT_Y && floor_y < PLOT_BOTTOM) {
-      for (int x = col_x; x < col_x + 15; ++x) {
+      for (int x = col_x; x < col_x + BAR_PITCH; ++x) {
         if (((x - PLOT_X) & 0x03) < 2) {
           const uint8_t cur = getPixel(x, floor_y);
           setPixel(x, floor_y, (cur == COLOR_BLACK) ? COLOR_WHITE : COLOR_BLACK);
@@ -568,21 +625,21 @@ void DisplayUi_Render(const DisplayUiState_t &state) {
     }
   }
 
-  // X-axis frequency labels (non-overlapping selected landmarks)
+  // X-axis frequency labels (non-overlapping landmarks across 26 bands)
   struct AxisLabel { uint8_t idx; const char *txt; int offset_x; };
   static const AxisLabel kLabels[] = {
-    { 0, "63",    -6 },
-    { 3, "125",   -9 },
-    { 6, "250",   -9 },
-    { 9, "500",   -9 },
-    {12, "1k",    -6 },
-    {15, "2k",    -6 },
-    {18, "4k",    -6 },
-    {21, "8k",    -6 },
-    {23, "12.5k", -18}
+    { 0, "63",   -6 },
+    { 3, "125",  -9 },
+    { 6, "250",  -9 },
+    { 9, "500",  -9 },
+    {12, "1k",   -6 },
+    {15, "2k",   -6 },
+    {18, "4k",   -6 },
+    {21, "8k",   -6 },
+    {25, "20k", -12 }
   };
   for (size_t i = 0; i < sizeof(kLabels) / sizeof(kLabels[0]); ++i) {
-    const int cx = PLOT_X + (static_cast<int>(kLabels[i].idx) * 15) + 7 + kLabels[i].offset_x;
+    const int cx = PLOT_X + (static_cast<int>(kLabels[i].idx) * BAR_PITCH) + 7 + kLabels[i].offset_x;
     drawText(cx, PLOT_Y + PLOT_H + 7, kLabels[i].txt, COLOR_BLACK, 1);
   }
 
@@ -604,6 +661,39 @@ void DisplayUi_Render(const DisplayUiState_t &state) {
            static_cast<unsigned long>(up_s),
            sd_lbl);
   drawText(6, 287, footer, COLOR_BLACK, 1);
+
+  flushFrame();
+}
+
+void DisplayUi_RenderLowBatterySleep(uint32_t vbat_mv, const char *time_hm) {
+  if (!s_inited || s_disp_buf == nullptr) {
+    return;
+  }
+
+  clearBuffer(COLOR_WHITE);
+
+  // Header bar
+  fillRect(0, 0, RLCD_WIDTH, 24, COLOR_BLACK);
+  const char *t_str = (time_hm != nullptr && time_hm[0] != '\0') ? time_hm : "0000-00-00 00:00:00";
+  drawText(6, 5, t_str, COLOR_WHITE, 2);
+
+  char bat_hdr[24];
+  snprintf(bat_hdr, sizeof(bat_hdr), "VBAT: %lu mV", static_cast<unsigned long>(vbat_mv));
+  drawText(296, 8, bat_hdr, COLOR_WHITE, 1);
+
+  // Center alert frame
+  drawRect(20, 68, 360, 164, COLOR_BLACK);
+  drawRect(22, 70, 356, 160, COLOR_BLACK);
+  fillRect(20, 68, 360, 28, COLOR_BLACK);
+  drawText(92, 78, "! LOW BATTERY PROTECTION !", COLOR_WHITE, 1);
+
+  drawText(44, 118, "LOW BATTERY - SLEEP", COLOR_BLACK, 2);
+  drawText(54, 154, "VBAT <= 3350 mV for 3 consecutive min", COLOR_BLACK, 1);
+  drawText(54, 174, "MicroSD card safely flushed & unmounted.", COLOR_BLACK, 1);
+  drawText(54, 194, "Charge 18650 or press KEY to wake.", COLOR_BLACK, 1);
+
+  fillRect(0, 276, RLCD_WIDTH, 24, COLOR_BLACK);
+  drawText(58, 284, "Deep Sleep Active - File System Protected", COLOR_WHITE, 1);
 
   flushFrame();
 }

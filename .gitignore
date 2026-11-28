@@ -3,3 +3,8 @@ build/
 *.bin
 *.elf
 *.map
+.venv/
+__pycache__/
+*.pyc
+logs/
+reports/

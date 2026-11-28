@@ -19,6 +19,7 @@ bool NetworkSync_EnqueueJson(const char *json_payload);
 
 bool NetworkSync_IsWifiConfigured();
 bool NetworkSync_IsWifiConnected();
+bool NetworkSync_IsWifiSleeping();
 int  NetworkSync_GetRssi();
 bool NetworkSync_IsHttpConfigured();
 HttpSyncState_t NetworkSync_GetHttpState();

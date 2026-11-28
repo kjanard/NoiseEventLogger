@@ -1,5 +1,6 @@
 #include "audio_capture.h"
 #include "board_pins.h"
+#include "calibration.h"
 #include "config.h"
 
 #include <math.h>
@@ -7,7 +8,12 @@
 #include <driver/i2s_tdm.h>
 
 // ============================================================================
-// ES7210 Register Definitions (from reference es7210_reg.h)
+// ES7210 Register Definitions
+// Reference: reference/examples/arduino/examples/07_Audio_Test/src/ExternLib/
+//            esp_codec_dev/device/es7210/es7210.c
+// For fs = 48000 Hz, MCLK = 256 * 48000 = 12,288,000 Hz (0 ppm from PLL_F160M):
+//   es7210.c line 98: {12288000, 48000, 0x00, 0x01, 0x01, 0x01, 0x20, ...}
+//   Slave mode REG02 = 0xC1, REG07 = 0x20 (es7210.c lines 443, 449-451)
 // ============================================================================
 namespace {
 
@@ -44,27 +50,39 @@ constexpr uint8_t ES7210_MIC34_POWER_REG4C     = 0x4C;
 
 constexpr float   PCM_FULL_SCALE               = 32768.0f;
 
-TwoWire          *s_wire    = nullptr;
-i2s_chan_handle_t s_rx_chan = nullptr;
-bool              s_inited  = false;
+TwoWire          *s_wire               = nullptr;
+i2s_chan_handle_t s_rx_chan            = nullptr;
+bool              s_inited             = false;
+float             s_configured_gain_db = ES7210_MIC_GAIN_DB;
 
-// Map dB value to ES7210 4-bit PGA gain code (matches reference es7210.c get_db())
+// Map dB value to ES7210 4-bit PGA gain code (matches es7210_reg.h gain_value enum):
+// 0..10 => 0..30 dB (3 dB steps), 11 => 33.0 dB, 12 => 34.5 dB, 13 => 36.0 dB, 14 => 37.5 dB
 uint8_t es7210GainCodeFromDb(float db) {
-  db += 0.5f;
-  if (db < 33.0f) {
-    int idx = (db < 3.0f) ? 0 : static_cast<int>(db / 3.0f);
-    return static_cast<uint8_t>(idx);  // 0..10 => 0..30 dB in 3 dB steps
+  if (db < 1.5f) {
+    return 0;  // 0 dB
   }
-  if (db < 34.5f) {
-    return 10;  // 30 dB
+  if (db < 31.5f) {
+    return static_cast<uint8_t>((db + 1.5f) / 3.0f);  // 1..10 => 3..30 dB
   }
-  if (db < 36.0f) {
-    return 12;  // 34.5 dB
+  if (db < 33.75f) {
+    return 11;  // 33.0 dB (GAIN_33DB)
   }
-  if (db < 37.0f) {
-    return 13;  // 36 dB
+  if (db < 35.25f) {
+    return 12;  // 34.5 dB (GAIN_34_5DB)
   }
-  return 14;    // 37.5 dB
+  if (db < 36.75f) {
+    return 13;  // 36.0 dB (GAIN_36DB)
+  }
+  return 14;    // 37.5 dB (GAIN_37_5DB)
+}
+
+float es7210DbFromGainCode(uint8_t code) {
+  if (code <= 11) {
+    return static_cast<float>(code) * 3.0f;
+  }
+  if (code == 12) return 34.5f;
+  if (code == 13) return 36.0f;
+  return 37.5f;
 }
 
 bool es7210WriteReg(uint8_t reg, uint8_t val) {
@@ -150,13 +168,12 @@ bool initI2sTdmRx() {
     return false;
   }
 
-  // Allow MCLK/BCLK/WS to stabilize before writing ES7210 I2C registers
+  // Allow 12.288 MHz MCLK / BCLK / WS to stabilize before ES7210 I2C writes
   delay(10);
   return true;
 }
 
 bool initEs7210FixedGain(float fixed_gain_db) {
-  // Probe ES7210 on the shared I2C bus
   s_wire->beginTransmission(I2C_ADDR_ES7210);
   if (s_wire->endTransmission() != 0) {
     Serial.printf("[Audio] ES7210 not responding at I2C 0x%02X\n", I2C_ADDR_ES7210);
@@ -165,6 +182,7 @@ bool initEs7210FixedGain(float fixed_gain_db) {
 
   const uint8_t gain_code = es7210GainCodeFromDb(fixed_gain_db);
   const uint8_t gain_reg_val = static_cast<uint8_t>(0x10U | (gain_code & 0x0FU));
+  s_configured_gain_db = es7210DbFromGainCode(gain_code);
 
   bool ok = true;
   ok &= es7210WriteReg(ES7210_RESET_REG00, 0xFF);
@@ -174,7 +192,7 @@ bool initEs7210FixedGain(float fixed_gain_db) {
   ok &= es7210WriteReg(ES7210_TIME_CONTROL0_REG09, 0x30);
   ok &= es7210WriteReg(ES7210_TIME_CONTROL1_REG0A, 0x30);
 
-  // Enable built-in DC-blocking HPF (from reference es7210.c lines 420-423)
+  // Enable built-in DC-blocking HPF (reference es7210.c lines 420-423)
   ok &= es7210WriteReg(ES7210_ADC12_HPF2_REG23, 0x2A);
   ok &= es7210WriteReg(ES7210_ADC12_HPF1_REG22, 0x0A);
   ok &= es7210WriteReg(ES7210_ADC34_HPF2_REG20, 0x0A);
@@ -185,19 +203,20 @@ bool initEs7210FixedGain(float fixed_gain_db) {
   ok &= es7210WriteReg(ES7210_ANALOG_REG40, 0x43);
   ok &= es7210WriteReg(ES7210_MIC12_BIAS_REG41, 0x70);
   ok &= es7210WriteReg(ES7210_MIC34_BIAS_REG42, 0x70);
+  // REG07 = 0x20, REG02 = 0xC1 match es7210.c line 98 for 48 kHz @ 12.288 MHz MCLK
   ok &= es7210WriteReg(ES7210_OSR_REG07, 0x20);
   ok &= es7210WriteReg(ES7210_MAINCLK_REG02, 0xC1);
 
-  // Explicitly disable automute / dynamic gain control while preserving upper bits
+  // Explicitly disable automute / dynamic gain control
   ok &= es7210WriteReg(ES7210_ADC_AUTOMUTE_REG13, 0x00);
   ok &= es7210UpdateRegBit(ES7210_ADC34_MUTERANGE_REG14, 0x03, 0x00);
   ok &= es7210UpdateRegBit(ES7210_ADC12_MUTERANGE_REG15, 0x03, 0x00);
 
-  // 16-bit Philips I2S + 4-channel TDM mode on SDOUT1 preserving middle bits (es7210.c lines 230, 243, 276)
+  // 16-bit Philips I2S + 4-channel TDM mode on SDOUT1 (es7210.c lines 230, 243, 276)
   ok &= es7210UpdateRegBit(ES7210_SDP_INTERFACE1_REG11, 0xE3, 0x60);
   ok &= es7210WriteReg(ES7210_SDP_INTERFACE2_REG12, 0x02);
 
-  // Power up ADC & MIC PGAs and lock fixed manual gain preserving bits [7:5]
+  // Power up ADC & MIC PGAs and lock fixed manual gain
   ok &= es7210WriteReg(ES7210_POWER_DOWN_REG06, 0x00);
   ok &= es7210WriteReg(ES7210_ANALOG_REG40, 0x43);
   ok &= es7210WriteReg(ES7210_MIC1_POWER_REG47, 0x08);
@@ -212,7 +231,7 @@ bool initEs7210FixedGain(float fixed_gain_db) {
   ok &= es7210UpdateRegBit(ES7210_MIC3_GAIN_REG45, 0x1F, gain_reg_val);
   ok &= es7210UpdateRegBit(ES7210_MIC4_GAIN_REG46, 0x1F, gain_reg_val);
 
-  // Enable ADC1-4 clocks matching es7210.c (0x3F & ~(0x0B | 0x15) = 0x20)
+  // Enable ADC1-4 clocks matching es7210.c
   ok &= es7210UpdateRegBit(ES7210_CLOCK_OFF_REG01, 0x1F, 0x00);
   ok &= es7210WriteReg(ES7210_ANALOG_REG40, 0x43);
   ok &= es7210WriteReg(ES7210_RESET_REG00, 0x71);
@@ -270,7 +289,8 @@ void measureStartupTdmSlots() {
     total_frames += frames_read;
   }
 
-  float slot_dbfs[AUDIO_TDM_SLOTS] = {};
+  float slot_lvl[AUDIO_TDM_SLOTS] = {};
+  const float cal_ofs = Calibration_GetOffsetDb();
   const double inv_n = 1.0 / static_cast<double>(total_frames);
   for (uint8_t s = 0; s < AUDIO_TDM_SLOTS; ++s) {
     const double mean = sum_x[s] * inv_n;
@@ -280,11 +300,11 @@ void measureStartupTdmSlots() {
     }
     const float rms_norm = static_cast<float>(sqrt(var)) / PCM_FULL_SCALE;
     const float power = rms_norm * rms_norm;
-    slot_dbfs[s] = 10.0f * log10f(fmaxf(power, DBFS_POWER_EPSILON)) + CALIBRATION_OFFSET_DB;
+    slot_lvl[s] = 10.0f * log10f(fmaxf(power, DBFS_POWER_EPSILON)) + cal_ofs;
   }
 
-  Serial.printf("[Audio] TDM 4-Slot Floor (100ms): S0(MIC1)=%.1f S1(MIC3)=%.1f S2(MIC2)=%.1f S3(MIC4)=%.1f dBFS\n",
-                slot_dbfs[0], slot_dbfs[1], slot_dbfs[2], slot_dbfs[3]);
+  Serial.printf("[Audio] TDM 4-Slot Floor (100ms): S0(MIC1)=%.1f S1(MIC3)=%.1f S2(MIC2)=%.1f S3(MIC4)=%.1f %s\n",
+                slot_lvl[0], slot_lvl[1], slot_lvl[2], slot_lvl[3], Calibration_GetUnitLabel());
 }
 
 }  // namespace
@@ -340,7 +360,6 @@ bool AudioCapture_CaptureOneSecond(AudioMetrics1s_t *out_metrics) {
 
     const uint32_t frames_read = static_cast<uint32_t>(bytes_read / (AUDIO_TDM_SLOTS * sizeof(int16_t)));
     for (uint32_t i = 0; i < frames_read; ++i) {
-      // Primary microphone TDM slot (0=MIC1, 1=MIC3, 2=MIC2, 3=MIC4)
       const int32_t raw_sample = static_cast<int32_t>(tdm_buf[(i * AUDIO_TDM_SLOTS) + AUDIO_PRIMARY_MIC_CHANNEL]);
       const int32_t abs_raw = (raw_sample < 0) ? -raw_sample : raw_sample;
 
@@ -356,12 +375,11 @@ bool AudioCapture_CaptureOneSecond(AudioMetrics1s_t *out_metrics) {
       sum_x2 += x * x;
     }
 
-    // Strict privacy: wipe raw PCM buffer from RAM immediately after processing
     memset(tdm_buf, 0, sizeof(tdm_buf));
     total_samples += frames_read;
   }
 
-  // Exact 1-second mean DC offset & DC-removed broadband RMS (Var(x) = E[x^2] - E[x]^2)
+  const float cal_ofs = Calibration_GetOffsetDb();
   const double inv_n = 1.0 / static_cast<double>(total_samples);
   const double mean_pcm = sum_x * inv_n;
   double var_pcm = (sum_x2 * inv_n) - (mean_pcm * mean_pcm);
@@ -372,11 +390,11 @@ bool AudioCapture_CaptureOneSecond(AudioMetrics1s_t *out_metrics) {
   const float rms_pcm = static_cast<float>(sqrt(var_pcm));
   const float rms_norm = rms_pcm / PCM_FULL_SCALE;
   const float rms_power = rms_norm * rms_norm;
-  const float rms_dbfs = 10.0f * log10f(fmaxf(rms_power, DBFS_POWER_EPSILON)) + CALIBRATION_OFFSET_DB;
+  const float rms_dbfs = 10.0f * log10f(fmaxf(rms_power, DBFS_POWER_EPSILON)) + cal_ofs;
 
   const float peak_norm = static_cast<float>(max_abs_pcm) / PCM_FULL_SCALE;
   const float peak_power = peak_norm * peak_norm;
-  const float peak_dbfs = 10.0f * log10f(fmaxf(peak_power, DBFS_POWER_EPSILON)) + CALIBRATION_OFFSET_DB;
+  const float peak_dbfs = 10.0f * log10f(fmaxf(peak_power, DBFS_POWER_EPSILON)) + cal_ofs;
 
   out_metrics->sample_count = total_samples;
   out_metrics->dc_mean_pcm  = static_cast<float>(mean_pcm);
@@ -441,4 +459,37 @@ bool AudioCapture_ReadMonoSamples(int16_t *mono_out,
 
 bool AudioCapture_ReadEs7210Reg(uint8_t reg_addr, uint8_t *out_val) {
   return es7210ReadReg(reg_addr, out_val);
+}
+
+float AudioCapture_GetConfiguredGainDb() {
+  return s_configured_gain_db;
+}
+
+void AudioCapture_PowerDown(SemaphoreHandle_t i2c_mutex) {
+  // Match reference es7210_stop() (es7210.c lines 313-325)
+  bool locked = true;
+  if (i2c_mutex != nullptr) {
+    locked = (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(200)) == pdTRUE);
+  }
+  if (locked && s_wire != nullptr) {
+    es7210WriteReg(ES7210_MIC1_POWER_REG47, 0xFF);
+    es7210WriteReg(ES7210_MIC2_POWER_REG48, 0xFF);
+    es7210WriteReg(ES7210_MIC3_POWER_REG49, 0xFF);
+    es7210WriteReg(ES7210_MIC4_POWER_REG4A, 0xFF);
+    es7210WriteReg(ES7210_MIC12_POWER_REG4B, 0xFF);
+    es7210WriteReg(ES7210_MIC34_POWER_REG4C, 0xFF);
+    es7210WriteReg(ES7210_ANALOG_REG40, 0xC0);
+    es7210WriteReg(ES7210_CLOCK_OFF_REG01, 0x7F);
+    es7210WriteReg(ES7210_POWER_DOWN_REG06, 0x07);
+  }
+  if (i2c_mutex != nullptr && locked) {
+    xSemaphoreGive(i2c_mutex);
+  }
+
+  if (s_rx_chan != nullptr) {
+    i2s_channel_disable(s_rx_chan);
+    i2s_del_channel(s_rx_chan);
+    s_rx_chan = nullptr;
+  }
+  s_inited = false;
 }

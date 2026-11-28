@@ -1,7 +1,11 @@
 #include <Arduino.h>
+#include <WiFi.h>
 #include <Wire.h>
 #include <atomic>
+#include <driver/gpio.h>
+#include <driver/rtc_io.h>
 #include <esp_heap_caps.h>
+#include <esp_sleep.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
@@ -11,6 +15,7 @@
 #include "config.h"
 #include "board_pins.h"
 #include "audio_capture.h"
+#include "calibration.h"
 #include "dsp_octave.h"
 #include "rtc_time.h"
 #include "storage_log.h"
@@ -23,13 +28,18 @@ SemaphoreHandle_t s_i2cMutex = nullptr;
 QueueHandle_t     s_secQueue = nullptr;
 QueueHandle_t     s_minQueue = nullptr;
 
-// Static SRAM hop buffer (4000 B) so AudioDspTask stack stays light
+// Static SRAM hop buffer (6000 B @ 48 kHz) so AudioDspTask stack stays light
 int16_t s_hop_buf[AUDIO_HOP_SAMPLES];
 
-// Static Core 0 UI snapshot to avoid putting large structs on SystemIoTask stack
+// Static Core 0 UI snapshot & daily HF nuisance tracking
 DisplayUiState_t s_uiState = {};
 char             s_uiTimeHm[24] = {};
 char             s_uiSdPath[48] = {};
+char             s_hfEventDateYmd[16] = {};
+uint32_t         s_hfEventsToday = 0;
+bool             s_markerActive = false;
+bool             s_markerLatchedThisMin = false;
+uint8_t          s_lowBatConsecMin = 0;
 
 std::atomic<uint32_t> s_i2sReadErrors{0};
 std::atomic<uint32_t> s_secQueueDropped{0};
@@ -67,7 +77,7 @@ const char *lookupKnownI2cDevice(uint8_t addr) {
 void printBootSystemInfo() {
   Serial.println();
   Serial.println("==================================================================");
-  Serial.printf("NoiseEventLogger (%s) — Phase 3: Full System Integration\n", DEVICE_ID);
+  Serial.printf("NoiseEventLogger (%s) -- Phase 4: 48kHz 26-Band + IEC 61672 L1 + HF Det\n", DEVICE_ID);
   Serial.println("Board: Waveshare ESP32-S3-RLCD-4.2");
   Serial.println("==================================================================");
   Serial.printf("[Sys] Chip: %s Rev %u | Cores: %u @ %lu MHz\n",
@@ -137,6 +147,15 @@ void serialPrintlnNonBlocking(const char *str) {
   }
 }
 
+void serialPrintMinuteJson(const char *str) {
+  if (str == nullptr || !Serial) {
+    return;
+  }
+  if (Serial.availableForWrite() > 0) {
+    Serial.println(str);
+  }
+}
+
 void printEs7210RegisterSummary() {
   const uint8_t regs[] = { 0x01, 0x02, 0x07, 0x08, 0x11, 0x12, 0x13, 0x43 };
   char line[160];
@@ -154,7 +173,7 @@ void printEs7210RegisterSummary() {
 
 void printBandLabels() {
   char line[256];
-  int pos = snprintf(line, sizeof(line), "[Bands] idx 0..23:");
+  int pos = snprintf(line, sizeof(line), "[Bands] idx 0..%u:", static_cast<unsigned>(OCTAVE_BAND_COUNT - 1U));
   for (uint8_t b = 0; b < OCTAVE_BAND_COUNT && pos > 0 && static_cast<size_t>(pos) < sizeof(line); ++b) {
     pos += snprintf(line + pos, sizeof(line) - static_cast<size_t>(pos), " %s", OCTAVE_BAND_LABELS[b]);
   }
@@ -176,15 +195,70 @@ void refreshUiSnapshotAndDraw(uint32_t vbat_mv) {
   s_uiState.rtc_ok          = RtcTime_IsRtcOk();
   s_uiState.wifi_configured = NetworkSync_IsWifiConfigured();
   s_uiState.wifi_connected  = NetworkSync_IsWifiConnected();
+  s_uiState.wifi_sleeping   = NetworkSync_IsWifiSleeping();
   s_uiState.rssi            = NetworkSync_GetRssi();
   s_uiState.sd_ok           = StorageLog_IsOk();
   s_uiState.sd_path         = s_uiSdPath;
   s_uiState.vbat_mv         = vbat_mv;
   s_uiState.http_state      = NetworkSync_GetHttpState();
   s_uiState.http_queued     = NetworkSync_GetQueuedCount();
+  s_uiState.calibrated      = Calibration_IsCalibrated();
+  s_uiState.cal_offset_db   = Calibration_GetOffsetDb();
+  s_uiState.gain_db         = AudioCapture_GetConfiguredGainDb();
+  s_uiState.marker_active   = s_markerActive;
+  s_uiState.hf_events_today = s_hfEventsToday;
   s_uiState.uptime_s        = static_cast<uint32_t>(millis() / 1000UL);
 
   DisplayUi_Render(s_uiState);
+}
+
+bool pollKeyButton() {
+  static int s_last_raw = HIGH;
+  static int s_stable_state = HIGH;
+  static uint32_t s_last_edge_ms = 0;
+
+  const int raw = digitalRead(PIN_BTN_KEY);
+  const uint32_t now_ms = millis();
+  if (raw != s_last_raw) {
+    s_last_raw = raw;
+    s_last_edge_ms = now_ms;
+  }
+  if ((now_ms - s_last_edge_ms) >= KEY_DEBOUNCE_MS && raw != s_stable_state) {
+    s_stable_state = raw;
+    if (s_stable_state == LOW) {
+      s_markerActive = !s_markerActive;
+      if (s_markerActive) {
+        s_markerLatchedThisMin = true;
+      }
+      Serial.printf("[Marker] KEY button -> marker=%u\n", s_markerActive ? 1U : 0U);
+      return true;
+    }
+  }
+  return false;
+}
+
+void enterLowBatteryDeepSleep(uint32_t vbat_mv) {
+  Serial.printf("[Power] VBAT=%lu mV <= %u mV for %u min -> Safe shutdown & Deep Sleep\n",
+                static_cast<unsigned long>(vbat_mv),
+                LOW_BAT_CUTOFF_MV,
+                LOW_BAT_CONSECUTIVE_MIN);
+  Serial.flush();
+
+  StorageLog_Shutdown();
+  WiFi.mode(WIFI_OFF);
+  AudioCapture_PowerDown(s_i2cMutex);
+
+  if (!RtcTime_FormatDisplayHms(RtcTime_NowEpoch(), s_uiTimeHm, sizeof(s_uiTimeHm))) {
+    snprintf(s_uiTimeHm, sizeof(s_uiTimeHm), "1970-01-01 00:00:00");
+  }
+  DisplayUi_RenderLowBatterySleep(vbat_mv, s_uiTimeHm);
+
+  gpio_hold_en(static_cast<gpio_num_t>(PIN_RLCD_RST));
+  gpio_deep_sleep_hold_en();
+  rtc_gpio_pullup_en(static_cast<gpio_num_t>(PIN_BTN_KEY));
+  rtc_gpio_pulldown_dis(static_cast<gpio_num_t>(PIN_BTN_KEY));
+  esp_sleep_enable_ext0_wakeup(static_cast<gpio_num_t>(PIN_BTN_KEY), 0);
+  esp_deep_sleep_start();
 }
 
 // High-priority real-time audio & FFT task pinned strictly to Core 1
@@ -215,7 +289,7 @@ void AudioDspTask(void *arg) {
                              &min_report,
                              &min_ready);
 
-    // Strict privacy: wipe raw hop PCM buffer immediately after FFT processing
+    // Strict privacy: wipe raw hop PCM buffer immediately after DSP processing
     memset(s_hop_buf, 0, sizeof(s_hop_buf));
 
     if (sec_ready && s_secQueue != nullptr) {
@@ -231,23 +305,24 @@ void AudioDspTask(void *arg) {
   }
 }
 
-// Non-real-time Core 0 task: RTC/NTP, SD_MMC CSV, Wi-Fi/HTTP, ST7305 RLCD, Serial
+// Non-real-time Core 0 task: Calibration CLI, RTC/NTP, SD_MMC CSV, Wi-Fi/HTTP, RLCD
 void SystemIoTask(void *arg) {
   (void)arg;
   SecondReport_t sec_report = {};
   MinuteReport_t min_report = {};
-  char sec_line[384];
-  char json_buf[1024];
+  char sec_line[448];
+  char json_buf[HTTP_JSON_SLOT_SIZE];
   char ts_iso[32];
   char date_ymd[16];
 
   uint32_t last_lcd_ms = millis();
 
   for (;;) {
+    Calibration_PollSerial(&s_uiState.sec, s_uiState.has_sec);
     NetworkSync_Poll();
     RtcTime_Poll();
 
-    bool need_lcd_refresh = false;
+    bool need_lcd_refresh = pollKeyButton();
 
     for (uint8_t burst = 0;
          burst < 4 && s_secQueue != nullptr && xQueueReceive(s_secQueue, &sec_report, 0) == pdTRUE;
@@ -263,9 +338,11 @@ void SystemIoTask(void *arg) {
       int pos = snprintf(
           sec_line,
           sizeof(sec_line),
-          "[1s] t=%lus | bb=%.1f pk=%.1f clips=%lu | oct=[",
+          "[1s] t=%lus | bb=%.1f laeq=%.1f laf=%.1f pk=%.1f clp=%lu | oct=[",
           static_cast<unsigned long>(sec_report.uptime_s),
           sec_report.bb_leq_1s,
+          sec_report.laeq_1s,
+          sec_report.laf_max_1s,
           sec_report.bb_peak_1s,
           static_cast<unsigned long>(sec_report.clips_1s));
       for (uint8_t b = 0; b < OCTAVE_BAND_COUNT && pos > 0 && static_cast<size_t>(pos) < sizeof(sec_line); ++b) {
@@ -297,22 +374,51 @@ void SystemIoTask(void *arg) {
         snprintf(date_ymd, sizeof(date_ymd), "unsynced");
       }
 
+      if (strcmp(date_ymd, "unsynced") != 0 && strcmp(date_ymd, s_hfEventDateYmd) != 0) {
+        if (s_hfEventDateYmd[0] != '\0') {
+          s_hfEventsToday = 0;
+        }
+        snprintf(s_hfEventDateYmd, sizeof(s_hfEventDateYmd), "%s", date_ymd);
+      }
+      if (min_report.hf_alert) {
+        s_hfEventsToday++;
+      }
+
       const uint32_t vbat_mv = readBatteryMilliVolts();
       const int rssi = NetworkSync_GetRssi();
+      const float gain_db = AudioCapture_GetConfiguredGainDb();
+      const bool min_marker = s_markerActive || s_markerLatchedThisMin;
+      s_markerLatchedThisMin = s_markerActive;
 
-      const bool sd_ok = StorageLog_AppendMinute(min_report, ts_iso, date_ymd, vbat_mv, rssi);
+      const bool sd_ok = StorageLog_AppendMinute(min_report, ts_iso, date_ymd, gain_db, min_marker, vbat_mv, rssi);
 
       MinuteSysInfo_t sys_info = {};
-      sys_info.ts_iso  = ts_iso;
-      sys_info.vbat_mv = vbat_mv;
-      sys_info.rssi    = rssi;
-      sys_info.sd_ok   = sd_ok;
+      sys_info.ts_iso          = ts_iso;
+      sys_info.gain_db         = gain_db;
+      sys_info.marker          = min_marker;
+      sys_info.vbat_mv         = vbat_mv;
+      sys_info.rssi            = rssi;
+      sys_info.sd_ok           = sd_ok;
+      sys_info.hf_events_today = s_hfEventsToday;
 
       if (DspOctave_FormatMinuteJson(min_report, &sys_info, json_buf, sizeof(json_buf)) > 0) {
         NetworkSync_EnqueueJson(json_buf);
-        serialPrintlnNonBlocking(json_buf);
+        serialPrintMinuteJson(json_buf);
       } else {
         serialPrintlnNonBlocking("[ERROR] Minute JSON buffer overflow");
+      }
+
+      if (vbat_mv >= LOW_BAT_MIN_PRESENT_MV && vbat_mv <= LOW_BAT_CUTOFF_MV) {
+        s_lowBatConsecMin++;
+        Serial.printf("[Power] Low battery warning: %lu mV (%u/%u min)\n",
+                      static_cast<unsigned long>(vbat_mv),
+                      static_cast<unsigned>(s_lowBatConsecMin),
+                      static_cast<unsigned>(LOW_BAT_CONSECUTIVE_MIN));
+        if (s_lowBatConsecMin >= LOW_BAT_CONSECUTIVE_MIN) {
+          enterLowBatteryDeepSleep(vbat_mv);
+        }
+      } else {
+        s_lowBatConsecMin = 0;
       }
 
       s_uiState.has_min    = true;
@@ -335,16 +441,19 @@ void SystemIoTask(void *arg) {
 }  // namespace
 
 void setup() {
-  Serial.setTxBufferSize(2048);
+  Serial.setTxBufferSize(4096);
   Serial.begin(SERIAL_BAUD_RATE);
-  Serial.setTxTimeoutMs(2);  // Prevent 2000ms HWCDC backpressure stalls when no Serial Monitor is open
+  Serial.setTxTimeoutMs(20); // Allow 1-minute JSON (~900B) to flush cleanly without long stalls when unplugged
   delay(200);                // Cold power-on 3.3V rail stabilization for ST7305 / ES7210 / PCF85063
 
-  // Configure battery divider ADC (GPIO 4, 12 dB attenuation, 3.0x divider)
   analogReadResolution(12);
   analogSetPinAttenuation(PIN_BAT_ADC, ADC_11db);
 
   printBootSystemInfo();
+
+  // Release RLCD RST hold if waking from deep sleep & configure KEY button (GPIO 18)
+  gpio_hold_dis(static_cast<gpio_num_t>(PIN_RLCD_RST));
+  pinMode(PIN_BTN_KEY, INPUT_PULLUP);
 
   // Keep speaker amplifier powered down during acoustic logging
   pinMode(PIN_PA_CTRL, OUTPUT);
@@ -364,14 +473,18 @@ void setup() {
     }
   }
 
-  // Phase 3 Core 0 peripherals: RTC, SD_MMC 1-bit, ST7305 RLCD
+  // Load NVS SPL calibration offsets before audio/DSP startup
+  Calibration_Init();
+  Serial.println("[CAL] Type 'CAL HELP' on Serial to calibrate with a 94 dB / 1 kHz source.");
+
+  // Core 0 peripherals: RTC, SD_MMC 1-bit, ST7305 RLCD
   RtcTime_Init(Wire, s_i2cMutex, __DATE__, __TIME__);
   StorageLog_Init();
   DisplayUi_Init();
-  refreshUiSnapshotAndDraw(readBatteryMilliVolts());  // Render immediately on cold boot
+  refreshUiSnapshotAndDraw(readBatteryMilliVolts());
   NetworkSync_Init();
 
-  // Phase 2 DSP initialization & self-test
+  // Phase 4 DSP initialization & self-test
   if (!DspOctave_Init()) {
     Serial.println("[ERROR] DspOctave_Init failed! Halting.");
     while (true) {
@@ -382,13 +495,18 @@ void setup() {
 #if RUN_DSP_SELF_TEST
   OctaveSelfTestResult_t self_test = {};
   const bool ok = DspOctave_RunSelfTest(&self_test);
-  Serial.printf("[SelfTest] 1kHz: td=%.2f spec=%.2f band12=%.2f dBFS | 4kHz: td=%.2f spec=%.2f band18=%.2f dBFS | fft=%lu us -> %s\n",
+  Serial.printf("[SelfTest] 1k: td=%.2f sp=%.2f b12=%.2f la=%.2f | 4k: td=%.2f sp=%.2f b18=%.2f la=%.2f | 16k: td=%.2f b24=%.2f la=%.2f | fft=%luus -> %s\n",
                 self_test.tone1k_td_dbfs,
                 self_test.tone1k_spec_dbfs,
                 self_test.tone1k_band12_dbfs,
+                self_test.tone1k_laeq_dbfs,
                 self_test.tone4k_td_dbfs,
                 self_test.tone4k_spec_dbfs,
                 self_test.tone4k_band18_dbfs,
+                self_test.tone4k_laeq_dbfs,
+                self_test.tone16k_td_dbfs,
+                self_test.tone16k_band24_dbfs,
+                self_test.tone16k_laeq_dbfs,
                 static_cast<unsigned long>(self_test.single_fft_us),
                 ok ? "PASS" : "FAIL");
   if (!ok) {
@@ -399,7 +517,7 @@ void setup() {
   }
 #endif
 
-  // Phase 1 Audio capture initialization (I2S TDM + ES7210)
+  // Phase 4 Audio capture initialization (I2S TDM @ 48 kHz + ES7210)
   if (!AudioCapture_Init(Wire, MIC_GAIN_DB)) {
     Serial.println("[ERROR] AudioCapture_Init failed! Halting.");
     while (true) {
@@ -417,10 +535,9 @@ void setup() {
   printBandLabels();
   Serial.println("[Privacy] Raw PCM DMA & hop buffers wiped immediately after DSP processing.");
 
-  // Draw initial boot status screen before RTOS tasks start
   refreshUiSnapshotAndDraw(readBatteryMilliVolts());
 
-  s_secQueue = xQueueCreate(4, sizeof(SecondReport_t));
+  s_secQueue = xQueueCreate(SEC_QUEUE_DEPTH, sizeof(SecondReport_t));
   s_minQueue = xQueueCreate(MIN_QUEUE_DEPTH, sizeof(MinuteReport_t));
   if (s_secQueue == nullptr || s_minQueue == nullptr) {
     Serial.println("[ERROR] Failed to create FreeRTOS queues! Halting.");
@@ -445,9 +562,10 @@ void setup() {
                           nullptr,
                           SYSTEM_IO_TASK_CORE);
 
-  Serial.printf("[RTOS] AudioDspTask->Core%d (prio %u) | SystemIoTask->Core%d (prio %u) | MinQ=%u\n\n",
+  Serial.printf("[RTOS] AudioDspTask->Core%d (prio %u) | SystemIoTask->Core%d (prio %u) | SecQ=%u MinQ=%u\n\n",
                 AUDIO_DSP_TASK_CORE, static_cast<unsigned>(AUDIO_DSP_TASK_PRIO),
                 SYSTEM_IO_TASK_CORE, static_cast<unsigned>(SYSTEM_IO_TASK_PRIO),
+                static_cast<unsigned>(SEC_QUEUE_DEPTH),
                 static_cast<unsigned>(MIN_QUEUE_DEPTH));
 }
 

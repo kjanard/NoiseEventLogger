@@ -20,11 +20,16 @@ The primary analytical goal is to distinguish **continuous stationary mid-to-hig
 - Minimal, low-refresh-rate status UI on the 4.2-inch monochrome `ST7305` RLCD ($400 \times 300$).
 - Dual persistence: daily rotating CSV/JSONL files on MicroSD (`SD_MMC` 1-bit mode) and HTTP POST JSON delivery over Wi-Fi to a local server/NAS.
 
-### Out of Scope (Deferred to Future Phase 4)
-- Deep sleep / light sleep power cycling.
-- Solar MPPT management or battery runtime optimization.
-- Acoustic SPL calibration curve fitting (a single configurable `CALIBRATION_OFFSET_DB` constant is sufficient for now; default `0.0` = raw `dBFS`).
-- Onboard `SHTC3` temp/humidity logging (optional nice-to-have only after Phase 3 is stable).
+### Out of Scope (Completed / Upgraded in Phase 4)
+- Deep sleep / light sleep power cycling and solar MPPT management (power profiling deferred after 48 kHz verification).
+- Multi-point laboratory IEC 61672-3 periodic verification (see `TODO.md`).
+
+### Phase 4 Additions (Implemented)
+- Sampling rate upgraded from $32000\text{ Hz}$ to $48000\text{ Hz}$ ($f_N = 24000\text{ Hz}$, `MCLK = 12.288 MHz` exact from `PLL_F160M`) with **26 IEC 61260 1/3-octave bands** ($63\text{ Hz}$ to $20\text{ kHz}$).
+- Time-domain **IEC 61672-1 A-weighting** 4-biquad DF2T IIR filter ($\le \pm 0.002\text{ dB}$ from $20\text{ Hz}$ to $20\text{ kHz}$) with exponential **Fast** ($\tau = 125\text{ ms}$) and **Slow** ($\tau = 1000\text{ ms}$) detectors (`LAeq`, `LA90`, `LAFmax`, `LASmax`, overload/under-range flags).
+- NVS-backed SPL calibration (`calibration.h/.cpp`) supporting global offset and per-band frequency trim via non-blocking Serial commands (`CAL 94.0`, `CAL OFFSET`, `CAL BAND`, `CAL STATUS`, `CAL RESET`).
+- On-device **High-Frequency Stationary Jet Nuisance Detector** (`8 kHz – 20 kHz` L90 emergence + stationarity + narrowband prominence) rejecting broadband water splash and low-frequency machinery.
+- Offline Python daily evidence analyzer & report generator (`tools/analyze_noise_log.py`).
 
 ---
 
@@ -82,19 +87,25 @@ Arduino IDE compiles all `.h`/`.cpp` files inside the sketch folder automaticall
 ```text
 .
 ├── SPEC.md                          # This specification document
+├── TODO.md                          # IEC 61672 & PTEC calibration roadmap
+├── README.md                        # Quick start & Phase 4 overview
+├── requirements.txt                 # Python dependencies for offline analyzer
 ├── reference/                       # Official Waveshare ESP32-S3-RLCD-4.2 demos & schematic (read-only)
+├── tools/
+│   └── analyze_noise_log.py         # Phase 4: Daily spectrogram & evidence report generator
 └── NoiseEventLogger/
     ├── NoiseEventLogger.ino         # Setup, FreeRTOS task orchestration, main loop watchdog
-    ├── config.h                     # Sampling rate, FFT size, mic gain, intervals, calibration offset
+    ├── config.h                     # Sampling rate (48 kHz), 26 bands, FFT/hop, HF detector thresholds
     ├── secrets.example.h            # Template for Wi-Fi SSID/password and HTTP endpoint URL
     ├── secrets.h                    # Actual credentials (MUST be in .gitignore)
     ├── board_pins.h                 # Verified GPIO definitions extracted from ./reference/
-    ├── audio_capture.h / .cpp       # Phase 1: I2C init, ES7210 fixed-gain driver, I2S DMA reader
-    ├── dsp_octave.h / .cpp          # Phase 2: esp-dsp 4096-pt Hann FFT, 24 1/3-octave bands, 1m Leq/L90 stats
+    ├── calibration.h / .cpp         # Phase 4: NVS SPL offsets & non-blocking Serial CAL CLI
+    ├── audio_capture.h / .cpp       # Phase 1/4: I2C init, ES7210 fixed-gain driver, 48 kHz I2S TDM RX
+    ├── dsp_octave.h / .cpp          # Phase 2/4: esp-dsp 4096-pt FFT, 26 bands, IEC A-wt F/S, HF detector
     ├── rtc_time.h / .cpp            # Phase 3: PCF85063 driver + NTP synchronization + ISO-8601 helper
-    ├── display_ui.h / .cpp          # Phase 3: ST7305 RLCD low-refresh status screen
-    ├── storage_log.h / .cpp         # Phase 3: SD_MMC 1-bit daily CSV/JSONL logger
-    └── network_sync.h / .cpp        # Phase 3: Non-blocking Wi-Fi manager + HTTP POST queue
+    ├── display_ui.h / .cpp          # Phase 3/4: ST7305 26-band RLCD UI + HF alert + dBA/dBFS modes
+    ├── storage_log.h / .cpp         # Phase 3/4: SD_MMC 1-bit 67-col CSV logger + schema guard
+    └── network_sync.h / .cpp        # Phase 3/4: Non-blocking Wi-Fi manager + 1536 B HTTP POST queue
 ```
 
 ---
@@ -284,6 +295,30 @@ One compact JSON object per minute (no pretty-printing over network):
   - Unplugging Wi-Fi router does not interrupt 1-minute SD CSV logging or audio capture; reconnecting resumes HTTP POST automatically.
   - Rebooting without Wi-Fi preserves accurate timestamp from `PCF85063` RTC.
   - Display renders cleanly without artifacts or crashing PSRAM/heap over a 12-hour soak test.
+
+### Phase 4: 48 kHz / 26-Band Upgrade, IEC 61672 L1 Metrics & HF Jet Nuisance Detection
+- **Files added/updated:** `config.h`, `calibration.h/.cpp`, `audio_capture.cpp`, `dsp_octave.h/.cpp`, `display_ui.h/.cpp`, `storage_log.cpp`, `network_sync.cpp`, `NoiseEventLogger.ino`, `tools/analyze_noise_log.py`.
+- **Acoustic & DSP Changes:**
+  1. **48 kHz TDM Capture & 26-Band 1/3-Octave Spectrum:**
+     - `AUDIO_SAMPLE_RATE_HZ = 48000` (`Nyquist = 24000 Hz > 22627.4 Hz` upper edge of `20 kHz` band), `AUDIO_FFT_SIZE = 4096` ($\Delta f = 11.71875\text{ Hz}$), `AUDIO_HOP_SAMPLES = 3000` (`16 hops/s`, exact `1.000 s`). `I2S_MCLK_MULTIPLE_256` produces exact `12.288 MHz` MCLK from `PLL_F160M` (`0 ppm` clock divider drift).
+     - Adds Band 24 (`16k`, $14254.4 - 17959.4\text{ Hz}$, bins `1217..1532`) and Band 25 (`20k`, $17959.4 - 22627.4\text{ Hz}$, bins `1533..1930`); Band 0 (`63 Hz`) lower edge clamped to $54.0\text{ Hz}$ (bin `5` = $58.59\text{ Hz}$).
+  2. **IEC 61672-1 Time-Domain A-Weighting & F/S Detectors:**
+     - 4-biquad DF2T IIR filter (`double` state) in `dsp_octave.cpp` with $\le 0.0012\text{ dB}$ magnitude error across $20\text{ Hz} - 20\text{ kHz}$.
+     - Fast ($\tau = 0.125\text{ s}$) and Slow ($\tau = 1.0\text{ s}$) exponential integrators computing `laeq`, `la90`, `laf_max`, `las_max`, plus `overload` (`clips > 0`) and `underrange` (`raw bb_leq <= ANECHOIC_BB_LEQ_DBFS + 1.5 dB`) indicators.
+  3. **NVS Calibration CLI (`calibration.h/.cpp`):**
+     - Persists `active`, `ofs_db`, and `float[26]` per-band trim in NVS namespace `"cal"`.
+     - Serial commands (`CAL HELP`, `CAL STATUS`, `CAL <94.0>`, `CAL OFFSET <dB>`, `CAL BAND <idx|label> <dB>`, `CAL RESET`) update calibration live without reflashing; DSP keeps internal 60s buffers in raw `dBFS` so self-noise comparisons never mix units.
+  4. **HF Stationary Jet Nuisance Detector (`evaluateHfNuisance()`):**
+     - Evaluates raw `1/3`-octave $L_{90}$ in bands `21..25` (`8 kHz .. 20 kHz`): requires emergence $\ge 6.0\text{ dB}$ above `ANECHOIC_OCT_L90_DBFS[b]`, stationarity $L_{eq} - L_{90} \le 2.5\text{ dB}$, adjacent narrowband/two-band prominence $\ge 4.0\text{ dB}$, and emergence over $3.15 - 6.3\text{ kHz}$ mean $\ge 3.8\text{ dB}$. Rejects broadband water spray and low-frequency AC compressors.
+  5. **Updated Phase 4 Schemas:**
+     - **MicroSD CSV (`69` columns):** `ts,uptime_s,unit,gain_db,marker,bb_leq,bb_l90,bb_peak,laeq,la90,laf_max,las_max,clips,overload,underrange,hf_alert,hf_band_hz,hf_prom_db,leq_63..leq_20k,l90_63..l90_20k,vbat_mv,rssi`. Automatically selects `_p4.csv` / `_p4v2.csv` if an earlier-schema file exists on the same date.
+     - **HTTP JSON (`HTTP_JSON_SLOT_SIZE = 1536`):** Includes `"cal_db"`, `"fs_hz":48000`, `"gain_db"`, `"marker"`, `"bb":{..., "laeq", "la90", "laf_max", "las_max", "ovl", "ur"}`, `"hf":{"alert", "band", "prom_db", "emerg_db", "min_today"}`, and 26-element `oct_leq`/`oct_l90`.
+  6. **Manual Ground-Truth `KEY` Tagging, NTP-Only Wi-Fi Auto-Sleep & Low-Battery SD Protection:**
+     - `PIN_BTN_KEY` (`GPIO 18`, debounced `50 ms`) toggles live ground-truth `marker` (`0`/`1`), displayed as `*MARK*` alongside `gain_db` (`33.0 dB`, `ES7210` `REG 0x43..0x46 = 0x1B`) on the `ST7305` RLCD.
+     - NTP-only Wi-Fi auto power-off (`WIFI_SM_NTP_SLEEP`, RLCD `W:SLP`): when `WIFI_SSID` is configured and `INGEST_URL` is empty, `network_sync.cpp` shuts down the Wi-Fi radio (`WiFi.mode(WIFI_OFF)`) immediately after `PCF85063` is updated from SNTP (`NTP_WIFI_SYNC_TIMEOUT_MS = 30000 ms` fallback to `WIFI_OFF` backoff), waking every `24 h` (`NTP_RTC_SYNC_INTERVAL_MS`) to re-sync RTC time. Backoff states also power down the radio between retries.
+     - Low-battery guard: if `2500 mV <= vbat_mv <= 3350 mV` for `3` consecutive minutes, safely unmounts `SD_MMC`, powers down Wi-Fi & `ES7210`, displays `"LOW BATTERY - SLEEP"` (held via `gpio_deep_sleep_hold_en()`), and enters `esp_deep_sleep_start()` (wakeable via `KEY` or reset).
+  7. **Offline Evidence Analyzer (`tools/analyze_noise_log.py`):**
+     - Supports both 24-band Phase 3 and 26-band Phase 4 CSVs (including `gain_db` self-noise scaling and `marker` visualization); outputs `<date>_evidence_spectrogram.png`, `<date>_evidence_report.md`, and `<date>_hf_episodes.csv`.
 
 ---
 
