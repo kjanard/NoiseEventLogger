@@ -95,8 +95,8 @@ No reflashing is needed when calibrating with a 94 dB / 1 kHz IEC 60942 calibrat
 ## Repository Layout
 ```text
 NoiseEventLogger/
-├── reference/              # Official Waveshare ESP32-S3-RLCD-4.2 demos (read-only)
-├── LICENSE                 # MIT License (+ Waveshare reference notice)
+├── reference/              # Official Waveshare ESP32-S3-RLCD-4.2 demos (read-only, Waveshare license)
+├── LICENSE                 # MIT License
 ├── CHANGELOG.md            # Versioned acoustic/firmware/schema changelog
 ├── SPEC.md                 # Full engineering & mathematical specification (Phases 1–4)
 ├── TODO.md                 # IEC 61672 L1–L3 PTEC roadmap & Phase 5 SHTC3 backlog
